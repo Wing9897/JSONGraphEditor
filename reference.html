@@ -1,0 +1,1398 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JSON Graph Editor v10.0 - 完整重新設計</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .graph-container { overflow: hidden; }
+        .slot-dot { cursor: pointer; transition: all 0.2s ease; }
+        .slot-dot:hover { stroke-width: 3; transform: scale(1.2); }
+        .connection-line { fill: none; stroke-width: 2; }
+        .slot-connection { 
+            stroke: #8b5cf6; 
+            stroke-dasharray: none; 
+            filter: drop-shadow(0 2px 4px rgba(139, 92, 246, 0.3));
+        }
+        .parent-child-connection {
+            stroke: #999;
+            stroke-dasharray: 5,5;
+            opacity: 0.7;
+        }
+        .node-rect { cursor: move; transition: all 0.2s ease; }
+        .node-rect:hover { stroke-width: 2; transform: scale(1.02); }
+        .complex-box { box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
+        .table-cell { 
+            stroke: #e5e7eb; 
+            stroke-width: 1; 
+            fill: white; 
+        }
+        .table-cell:nth-child(even) { 
+            fill: #f9fafb; 
+        }
+        .table-header { 
+            fill: #f3f4f6; 
+            stroke: #d1d5db; 
+            font-weight: bold; 
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+        // =====================================
+        // 📋 核心數據管理系統
+        // =====================================
+        
+        /**
+         * 數據變更事件管理器
+         * 負責協調所有編輯器之間的數據同步
+         */
+        class DataChangeManager {
+            constructor(initialData, onDataChange) {
+                this.currentData = initialData;
+                this.onDataChange = onDataChange;
+                this.subscribers = new Set();
+                this.isUpdating = false;
+                this.updateQueue = [];
+            }
+            
+            // 註冊訂閱者
+            subscribe(subscriber) {
+                this.subscribers.add(subscriber);
+                return () => this.subscribers.delete(subscriber);
+            }
+            
+            // 更新數據
+            async updateData(newData, source = 'unknown') {
+                if (this.isUpdating) {
+                    this.updateQueue.push({ newData, source });
+                    return;
+                }
+                
+                this.isUpdating = true;
+                
+                try {
+                    console.log(`[DataManager] 數據更新來源: ${source}`);
+                    this.currentData = newData;
+                    
+                    // 通知父組件
+                    if (this.onDataChange) {
+                        this.onDataChange(newData);
+                    }
+                    
+                    // 通知所有訂閱者，但跳過更新來源
+                    this.subscribers.forEach(subscriber => {
+                        if (subscriber.id !== source) {
+                            subscriber.onDataChange(newData);
+                        }
+                    });
+                    
+                } finally {
+                    this.isUpdating = false;
+                    
+                    // 處理隊列中的更新
+                    if (this.updateQueue.length > 0) {
+                        const { newData: queuedData, source: queuedSource } = this.updateQueue.shift();
+                        setTimeout(() => this.updateData(queuedData, queuedSource), 0);
+                    }
+                }
+            }
+            
+            // 獲取當前數據
+            getCurrentData() {
+                return this.currentData;
+            }
+        }
+
+        // =====================================
+        // 🎯 主應用組件
+        // =====================================
+        
+        const JSONGraphEditor = () => {
+            // 初始數據
+            const initialData = {
+                users: [
+                    { id: 1, name: "Alice", age: 25, tags: ["developer", "react", "javascript"], profile: { city: "Tokyo", country: "Japan" } },
+                    { id: 2, name: "Bob", age: 30, tags: ["designer", "ui/ux", "figma"], profile: { city: "Seoul", country: "Korea" } }
+                ],
+                simpleArray: ["apple", "banana", "cherry"],
+                numberArray: [1, 2, 3, 4, 5],
+                mixedArray: ["text", 42, true, null],
+                nestedArray: [["a", "b"], ["c", "d"], ["e", "f"]],
+                products: [
+                    ["laptop", 1000, 5],
+                    ["mouse", 25, 100],
+                    ["keyboard", 75, 50]
+                ],
+                settings: {
+                    theme: "dark",
+                    notifications: true,
+                    features: ["chat", "video", "screen-share"],
+                    limits: {
+                        maxUsers: 100,
+                        maxFiles: 1000
+                    }
+                },
+                simpleValue: "Hello World",
+                numberValue: 42,
+                booleanValue: true
+            };
+            
+            const [jsonData, setJsonData] = useState(initialData);
+            const [selectedTable, setSelectedTable] = useState('');
+            const [selectedTableData, setSelectedTableData] = useState([]);
+            
+            // 創建數據管理器
+            const dataManager = useMemo(() => {
+                return new DataChangeManager(jsonData, setJsonData);
+            }, []);
+            
+            // 更新數據管理器的當前數據
+            useEffect(() => {
+                dataManager.currentData = jsonData;
+            }, [jsonData, dataManager]);
+            
+            // 處理表格數據更新
+            const handleTableDataChange = useCallback((newData, tableName) => {
+                if (!tableName || !newData) return;
+                
+                const newJsonData = { ...jsonData };
+                const keys = tableName.split('.');
+                let current = newJsonData;
+                
+                for (let i = 0; i < keys.length - 1; i++) {
+                    current = current[keys[i]];
+                }
+                current[keys[keys.length - 1]] = newData;
+                
+                dataManager.updateData(newJsonData, 'table-editor');
+            }, [jsonData, dataManager]);
+
+            return (
+                <div className="flex h-screen bg-gray-100">
+                    <div className="w-1/2 border-r">
+                        <GraphViewer 
+                            data={jsonData}
+                            onTableSelect={setSelectedTable}
+                            onTableDataChange={setSelectedTableData}
+                            dataManager={dataManager}
+                        />
+                    </div>
+                    <div className="w-1/2 flex flex-col">
+                        <div className="h-1/2 border-b">
+                            <TableEditor 
+                                tableName={selectedTable}
+                                data={selectedTableData}
+                                onDataChange={handleTableDataChange}
+                                dataManager={dataManager}
+                            />
+                        </div>
+                        <div className="h-1/2">
+                            <JsonEditor 
+                                data={jsonData}
+                                dataManager={dataManager}
+                            />
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // =====================================
+        // 📝 JSON編輯器 - 完全重新設計
+        // =====================================
+        
+        const JsonEditor = ({ data, dataManager }) => {
+            const [jsonText, setJsonText] = useState('');
+            const [error, setError] = useState('');
+            const [isFocused, setIsFocused] = useState(false);
+            
+            const debounceTimeoutRef = useRef(null);
+            const editorId = 'json-editor';
+            
+            // 初始化和外部數據同步
+            useEffect(() => {
+                const dataString = JSON.stringify(data, null, 2);
+                setJsonText(dataString);
+            }, []);
+            
+            // 註冊到數據管理器
+            useEffect(() => {
+                const unsubscribe = dataManager.subscribe({
+                    id: editorId,
+                    onDataChange: (newData) => {
+                        if (!isFocused) {
+                            const dataString = JSON.stringify(newData, null, 2);
+                            setJsonText(dataString);
+                        }
+                    }
+                });
+                
+                return unsubscribe;
+            }, [dataManager, isFocused]);
+            
+            const handleTextChange = (e) => {
+                const text = e.target.value;
+                setJsonText(text);
+                
+                // 清除之前的防抖
+                if (debounceTimeoutRef.current) {
+                    clearTimeout(debounceTimeoutRef.current);
+                }
+                
+                // 立即語法檢查
+                try {
+                    JSON.parse(text);
+                    setError('');
+                    
+                    // 防抖更新
+                    debounceTimeoutRef.current = setTimeout(() => {
+                        try {
+                            const parsed = JSON.parse(text);
+                            dataManager.updateData(parsed, editorId);
+                        } catch (err) {
+                            setError('JSON語法錯誤: ' + err.message);
+                        }
+                    }, 1000);
+                    
+                } catch (err) {
+                    setError('JSON語法錯誤: ' + err.message);
+                }
+            };
+            
+            const handleFocus = () => {
+                setIsFocused(true);
+            };
+            
+            const handleBlur = () => {
+                setIsFocused(false);
+                
+                // 立即更新
+                if (debounceTimeoutRef.current) {
+                    clearTimeout(debounceTimeoutRef.current);
+                }
+                
+                try {
+                    const parsed = JSON.parse(jsonText);
+                    dataManager.updateData(parsed, editorId);
+                    setError('');
+                } catch (err) {
+                    setError('JSON語法錯誤: ' + err.message);
+                }
+            };
+            
+            // 清理
+            useEffect(() => {
+                return () => {
+                    if (debounceTimeoutRef.current) {
+                        clearTimeout(debounceTimeoutRef.current);
+                    }
+                };
+            }, []);
+
+            return (
+                <div className="h-full flex flex-col">
+                    <div className="p-4 border-b bg-gray-50">
+                        <h2 className="text-lg font-semibold">JSON 編輯器 - v10.0 重新設計</h2>
+                        {error && <div className="text-red-500 text-sm mt-1">{error}</div>}
+                        <div className="text-xs text-gray-500 mt-1">
+                            狀態: {isFocused ? '編輯中' : '待機'} | 字符數: {jsonText.length}
+                        </div>
+                    </div>
+                    <div className="flex-1">
+                        <textarea
+                            value={jsonText}
+                            onChange={handleTextChange}
+                            onFocus={handleFocus}
+                            onBlur={handleBlur}
+                            className="w-full h-full p-4 font-mono text-sm resize-none border-none outline-none"
+                            placeholder="輸入 JSON 數據..."
+                        />
+                    </div>
+                </div>
+            );
+        };
+
+        // =====================================
+        // 📊 表格編輯器 - 完全重新設計
+        // =====================================
+        
+        const TableEditor = ({ tableName, data, onDataChange, dataManager }) => {
+            const [tableData, setTableData] = useState([]);
+            const [error, setError] = useState('');
+            const [isEditing, setIsEditing] = useState(false);
+            
+            const debounceTimeoutRef = useRef(null);
+            const editorId = 'table-editor';
+            
+            // 初始化表格數據
+            useEffect(() => {
+                if (data && Array.isArray(data)) {
+                    setTableData([...data]);
+                    setError('');
+                } else {
+                    setTableData([]);
+                    if (tableName) setError('所選數據不是2D陣列');
+                }
+            }, [data, tableName]);
+            
+            const updateTableData = (newData, immediate = false) => {
+                setTableData(newData);
+                
+                // 清除之前的防抖
+                if (debounceTimeoutRef.current) {
+                    clearTimeout(debounceTimeoutRef.current);
+                }
+                
+                const updateFn = () => {
+                    onDataChange(newData, tableName);
+                    setIsEditing(false);
+                };
+                
+                if (immediate) {
+                    updateFn();
+                } else {
+                    setIsEditing(true);
+                    debounceTimeoutRef.current = setTimeout(updateFn, 500);
+                }
+            };
+            
+            const handleCellChange = (rowIndex, colIndex, value) => {
+                const newData = [...tableData];
+                if (!newData[rowIndex]) newData[rowIndex] = [];
+                newData[rowIndex][colIndex] = value;
+                updateTableData(newData, false);
+            };
+            
+            const addRow = () => {
+                const newData = [...tableData, []];
+                updateTableData(newData, true);
+            };
+            
+            const addColumn = () => {
+                const newData = tableData.map(row => [...row, '']);
+                updateTableData(newData, true);
+            };
+            
+            // 清理
+            useEffect(() => {
+                return () => {
+                    if (debounceTimeoutRef.current) {
+                        clearTimeout(debounceTimeoutRef.current);
+                    }
+                };
+            }, []);
+            
+            if (!tableName) {
+                return (
+                    <div className="h-full flex items-center justify-center text-gray-500">
+                        <div className="text-center">
+                            <div className="text-4xl mb-4">📊</div>
+                            <p>點選圖中的 2D 陣列節點來編輯表格</p>
+                        </div>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="h-full flex flex-col">
+                    <div className="p-4 border-b bg-gray-50">
+                        <div className="flex justify-between items-center">
+                            <div>
+                                <h2 className="text-lg font-semibold">表格編輯器 - {tableName}</h2>
+                                <div className="text-xs text-gray-500">
+                                    狀態: {isEditing ? '編輯中' : '同步完成'} | 行數: {tableData.length}
+                                </div>
+                            </div>
+                            <div className="space-x-2">
+                                <button 
+                                    onClick={addRow}
+                                    className="px-3 py-1 bg-blue-500 text-white rounded text-sm hover:bg-blue-600"
+                                >
+                                    新增行
+                                </button>
+                                <button 
+                                    onClick={addColumn}
+                                    className="px-3 py-1 bg-green-500 text-white rounded text-sm hover:bg-green-600"
+                                >
+                                    新增列
+                                </button>
+                            </div>
+                        </div>
+                        {error && <div className="text-red-500 text-sm mt-2">{error}</div>}
+                    </div>
+                    
+                    <div className="flex-1 overflow-auto p-4">
+                        <div className="inline-block">
+                            <table className="border-collapse border border-gray-300">
+                                <tbody>
+                                    {tableData.map((row, rowIndex) => (
+                                        <tr key={rowIndex}>
+                                            {Array.from({ length: Math.max(1, Math.max(...tableData.map(r => r.length))) }).map((_, colIndex) => (
+                                                <td key={colIndex} className="border border-gray-300">
+                                                    <input
+                                                        type="text"
+                                                        value={row[colIndex] || ''}
+                                                        onChange={(e) => handleCellChange(rowIndex, colIndex, e.target.value)}
+                                                        className="w-20 p-1 border-none outline-none"
+                                                    />
+                                                </td>
+                                            ))}
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // =====================================
+        // 🔗 完整的圖形查看器 - 恢復JsonCrack風格
+        // =====================================
+        
+        const GraphViewer = ({ data, onTableSelect, onTableDataChange, dataManager }) => {
+            const svgRef = useRef(null);
+            const nodePositionsRef = useRef({}); // 記住節點位置
+            const isInitialLayoutRef = useRef(true); // 追蹤是否為初次布局
+            
+            const extractTables = useCallback((obj, path = '') => {
+                const result = [];
+                
+                const extractNodes = (obj, path, depth = 0, parentId = null) => {
+                    const nodes = [];
+                    const links = [];
+                    
+                    // 檢查是否為2D陣列
+                    const is2DArray = (arr) => {
+                        return Array.isArray(arr) && arr.length > 0 && 
+                               arr.every(item => Array.isArray(item));
+                    };
+                    
+                    // 檢查是否為複雜結構（需要用 complex-box 顯示）
+                    const isComplexStructure = (obj) => {
+                        if (Array.isArray(obj)) {
+                            // 只有2D陣列用專門的表格節點，所有其他陣列都用 complex-box 垂直列表顯示
+                            return !is2DArray(obj);
+                        }
+                        if (typeof obj === 'object' && obj !== null) {
+                            // 所有物件都用 complex-box 顯示，確保一致性
+                            return true;
+                        }
+                        return false;
+                    };
+                    
+                    const currentId = path || 'JSON';
+                    
+                    if (path === '') {
+                        nodes.push({
+                            id: 'JSON',
+                            name: 'JSON',
+                            data: obj,
+                            type: 'root',
+                            depth: 0,
+                            parentId: null,
+                            x: 0,
+                            y: 0
+                        });
+                        
+                        // 處理根對象的屬性
+                        if (typeof obj === 'object' && obj !== null && !Array.isArray(obj)) {
+                            Object.keys(obj).forEach(key => {
+                                const childResult = extractNodes(obj[key], key, 1, 'JSON');
+                                nodes.push(...childResult.nodes);
+                                links.push(...childResult.links);
+                                
+                                // 為根節點的每個屬性添加連接
+                                const childNode = childResult.nodes.find(n => n.id === key);
+                                if (childNode) {
+                                    links.push({
+                                        sourceId: 'JSON',
+                                        targetId: key,
+                                        type: 'root-child'
+                                    });
+                                }
+                            });
+                        }
+                    } else {
+                        // 根據數據類型創建節點
+                        if (Array.isArray(obj)) {
+                            if (is2DArray(obj)) {
+                                // 2D陣列 - 可編輯的表格，在圖中顯示實際表格內容
+                                nodes.push({
+                                    id: currentId,
+                                    name: path.split('.').pop(),
+                                    data: obj,
+                                    type: '2d-array',
+                                    depth: depth,
+                                    parentId: parentId,
+                                    x: 0,
+                                    y: 0
+                                });
+                            } else {
+                                // 所有其他陣列 - 使用 complex-box 垂直列表顯示
+                                const slots = [];
+                                const simpleProps = [];
+                                
+                                // 分析陣列內容，統一處理所有類型的陣列元素
+                                obj.forEach((item, index) => {
+                                    const slotId = `${currentId}[${index}]`;
+                                    
+                                    // 判斷元素類型
+                                    let itemType = 'primitive';
+                                    if (Array.isArray(item)) {
+                                        itemType = is2DArray(item) ? '2d-array' : 'array';
+                                    } else if (typeof item === 'object' && item !== null) {
+                                        itemType = 'object';
+                                    } else {
+                                        itemType = typeof item;
+                                    }
+                                    
+                                    // 對於基本類型，直接在 properties 中顯示，不創建 slot
+                                    if (typeof item !== 'object' || item === null) {
+                                        simpleProps.push({
+                                            key: `[${index}]`,
+                                            value: String(item),
+                                            type: typeof item
+                                        });
+                                    } else {
+                                        // 複雜元素創建 slot
+                                        slots.push({
+                                            key: `[${index}]`,
+                                            slotId: slotId,
+                                            type: itemType
+                                        });
+                                        
+                                        // 遞歸處理複雜元素
+                                        const childResult = extractNodes(item, slotId, depth + 1, currentId);
+                                        nodes.push(...childResult.nodes);
+                                        links.push(...childResult.links);
+                                        
+                                        // 添加slot連接
+                                        links.push({
+                                            sourceId: currentId,
+                                            targetId: slotId,
+                                            slotKey: `[${index}]`,
+                                            type: 'slot'
+                                        });
+                                    }
+                                });
+                                
+                                nodes.push({
+                                    id: currentId,
+                                    name: path.split('.').pop(),
+                                    data: obj,
+                                    type: 'complex-box',
+                                    subtype: 'array',
+                                    depth: depth,
+                                    parentId: parentId,
+                                    slots: slots,
+                                    properties: simpleProps,
+                                    x: 0,
+                                    y: 0
+                                });
+                            }
+                        } else if (typeof obj === 'object' && obj !== null) {
+                            // 所有物件都使用 complex-box 垂直列表顯示
+                            const slots = [];
+                            const simpleProps = [];
+                            
+                            Object.keys(obj).forEach(key => {
+                                const value = obj[key];
+                                const slotId = `${currentId}.${key}`;
+                                
+                                if (Array.isArray(value) || (typeof value === 'object' && value !== null)) {
+                                    // 複雜屬性 - 創建 slot
+                                    slots.push({
+                                        key: key,
+                                        slotId: slotId,
+                                        type: Array.isArray(value) ? 
+                                            (is2DArray(value) ? '2d-array' : 'array') 
+                                            : 'object'
+                                    });
+                                    
+                                    const childResult = extractNodes(value, slotId, depth + 1, currentId);
+                                    nodes.push(...childResult.nodes);
+                                    links.push(...childResult.links);
+                                    
+                                    links.push({
+                                        sourceId: currentId,
+                                        targetId: slotId,
+                                        slotKey: key,
+                                        type: 'slot'
+                                    });
+                                } else {
+                                    // 基本屬性
+                                    simpleProps.push({
+                                        key: key,
+                                        value: String(value),
+                                        type: typeof value
+                                    });
+                                }
+                            });
+                            
+                            nodes.push({
+                                id: currentId,
+                                name: path.split('.').pop(),
+                                data: obj,
+                                type: 'complex-box',
+                                subtype: 'object',
+                                depth: depth,
+                                parentId: parentId,
+                                slots: slots,
+                                properties: simpleProps,
+                                x: 0,
+                                y: 0
+                            });
+                        } else {
+                            // 基本類型
+                            let nodeType = 'primitive';
+                            if (typeof obj === 'string') nodeType = 'string';
+                            else if (typeof obj === 'number') nodeType = 'number';
+                            else if (typeof obj === 'boolean') nodeType = 'boolean';
+                            
+                            nodes.push({
+                                id: currentId,
+                                name: path.split('.').pop(),
+                                data: obj,
+                                type: nodeType,
+                                depth: depth,
+                                parentId: parentId,
+                                x: 0,
+                                y: 0
+                            });
+                            
+                            // 只為基本類型節點添加 parent-child 連接
+                            // complex-box 和 2d-array 節點使用 slot 連接，不需要 parent-child 連接
+                            if (parentId && (nodeType === 'string' || nodeType === 'number' || nodeType === 'boolean' || nodeType === 'primitive')) {
+                                if (!links.some(link => 
+                                    link.sourceId === parentId && link.targetId === currentId && link.type !== 'slot'
+                                )) {
+                                    links.push({
+                                        sourceId: parentId,
+                                        targetId: currentId,
+                                        type: 'parent-child'
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    
+                    return { nodes, links };
+                };
+                
+                return extractNodes(obj, path);
+            }, []);
+
+            // 檢測數據是否發生重大結構變化
+            const detectMajorStructureChange = useCallback((newData, oldData) => {
+                if (!oldData) return true; // 首次加載
+                
+                // 深度檢查結構變化
+                const checkStructure = (newObj, oldObj, depth = 0) => {
+                    if (depth > 3) return false; // 限制檢查深度，避免過深的遞歸
+                    
+                    if (typeof newObj !== typeof oldObj) return true;
+                    
+                    if (Array.isArray(newObj) && Array.isArray(oldObj)) {
+                        // 對於數組，只檢查長度的重大變化（超過50%變化才算重大變化）
+                        const lengthChange = Math.abs(newObj.length - oldObj.length);
+                        const maxLength = Math.max(newObj.length, oldObj.length);
+                        if (maxLength > 0 && lengthChange / maxLength > 0.5) return true;
+                        
+                        // 檢查數組元素的結構類型
+                        if (newObj.length > 0 && oldObj.length > 0) {
+                            return checkStructure(newObj[0], oldObj[0], depth + 1);
+                        }
+                        return false;
+                    }
+                    
+                    if (typeof newObj === 'object' && newObj !== null && oldObj !== null) {
+                        const newKeys = Object.keys(newObj).sort();
+                        const oldKeys = Object.keys(oldObj).sort();
+                        
+                        // 檢查鍵的變化
+                        if (newKeys.length !== oldKeys.length) return true;
+                        for (let i = 0; i < newKeys.length; i++) {
+                            if (newKeys[i] !== oldKeys[i]) return true;
+                        }
+                        
+                        // 檢查值的結構類型
+                        for (const key of newKeys) {
+                            if (checkStructure(newObj[key], oldObj[key], depth + 1)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    
+                    return false; // 基本類型的變化不算結構變化
+                };
+                
+                return checkStructure(newData, oldData);
+            }, []);
+            
+            const previousDataRef = useRef(null);
+            
+            useEffect(() => {
+                if (!data) return;
+                
+                // 檢查是否為重大結構變化
+                if (detectMajorStructureChange(data, previousDataRef.current)) {
+                    isInitialLayoutRef.current = true;
+                    nodePositionsRef.current = {};
+                }
+                
+                previousDataRef.current = data;
+                
+                const svg = d3.select(svgRef.current);
+                svg.selectAll("*").remove();
+                
+                const width = 800;
+                const height = 600;
+                
+                const container = svg.append('g');
+                
+                const zoom = d3.zoom()
+                    .scaleExtent([0.1, 3])
+                    .on('zoom', (event) => {
+                        container.attr('transform', event.transform);
+                    });
+                
+                svg.call(zoom);
+                
+                const { nodes, links } = extractTables(data);
+                
+                // JsonCrack 風格的穩定水平布局 - 保持節點位置穩定
+                const layoutNodes = (nodes) => {
+                    const startX = 100;  // 起始 X 位置
+                    const centerY = 300; // 畫布中心 Y
+                    const levelWidth = 280; // 每層之間的水平距離
+                    
+                    // 建立父子關係映射
+                    const childrenMap = {};
+                    nodes.forEach(node => {
+                        if (!childrenMap[node.parentId]) {
+                            childrenMap[node.parentId] = [];
+                        }
+                        if (node.parentId !== null) {
+                            childrenMap[node.parentId].push(node);
+                        }
+                    });
+                    
+                    // 計算節點尺寸的輔助函數
+                    function getNodeWidth(node) {
+                        if (node.type === 'complex-box') {
+                            return 220;
+                        } else if (node.type === '2d-array') {
+                            const data = node.data;
+                            if (data && data.length > 0) {
+                                const maxCols = Math.max(...data.map(row => row.length));
+                                return Math.max(200, maxCols * 80 + 40);
+                            }
+                            return 200;
+                        } else if (node.type === 'root') {
+                            return 80;
+                        } else {
+                            return 160;
+                        }
+                    }
+                    
+                    function getNodeHeight(node) {
+                        if (node.type === 'complex-box') {
+                            const properties = node.properties || [];
+                            const slots = node.slots || [];
+                            return 30 + properties.length * 20 + slots.length * 20;
+                        } else if (node.type === '2d-array') {
+                            const data = node.data;
+                            if (data && data.length > 0) {
+                                return Math.max(80, data.length * 25 + 40);
+                            }
+                            return 80;
+                        } else if (node.type === 'string' || node.type === 'number' || node.type === 'boolean' || node.type === 'primitive') {
+                            return 50;
+                        } else if (node.type === 'root') {
+                            return 30;
+                        }
+                        return 40;
+                    }
+                    
+                    // 如果不是初次布局，嘗試保持現有位置
+                    if (!isInitialLayoutRef.current) {
+                        nodes.forEach(node => {
+                            const savedPosition = nodePositionsRef.current[node.id];
+                            if (savedPosition) {
+                                node.x = savedPosition.x;
+                                node.y = savedPosition.y;
+                                return; // 保持現有位置，不重新計算
+                            }
+                        });
+                        
+                        // 只為新節點計算位置
+                        const newNodes = nodes.filter(node => !nodePositionsRef.current[node.id]);
+                        if (newNodes.length > 0) {
+                            // 為新節點分配位置（基於現有節點位置）
+                            newNodes.forEach(newNode => {
+                                // 找到父節點
+                                const parent = nodes.find(n => n.id === newNode.parentId);
+                                if (parent) {
+                                    // 計算父節點右側的位置
+                                    const parentLevel = Math.round((parent.x - startX) / levelWidth);
+                                    const newX = startX + (parentLevel + 1) * levelWidth;
+                                    
+                                    // 找到同層級的其他節點，避免重疊
+                                    const sameLevelNodes = nodes.filter(n => 
+                                        Math.abs(n.x - newX) < 50 && n.id !== newNode.id
+                                    );
+                                    
+                                    let newY = parent.y + getNodeHeight(parent) / 2;
+                                    if (sameLevelNodes.length > 0) {
+                                        // 找到可用的Y位置
+                                        const usedYPositions = sameLevelNodes.map(n => n.y).sort((a, b) => a - b);
+                                        let testY = newY;
+                                        const nodeHeight = getNodeHeight(newNode);
+                                        
+                                        for (let i = 0; i < usedYPositions.length; i++) {
+                                            if (testY + nodeHeight + 20 < usedYPositions[i]) {
+                                                break;
+                                            }
+                                            testY = usedYPositions[i] + getNodeHeight(sameLevelNodes.find(n => n.y === usedYPositions[i])) + 20;
+                                        }
+                                        newY = testY;
+                                    }
+                                    
+                                    newNode.x = newX;
+                                    newNode.y = newY;
+                                } else {
+                                    // 沒有父節點，可能是根節點或孤立節點
+                                    newNode.x = startX;
+                                    newNode.y = centerY - getNodeHeight(newNode) / 2;
+                                }
+                            });
+                        }
+                        
+                        // 儲存所有節點位置
+                        nodes.forEach(node => {
+                            nodePositionsRef.current[node.id] = { x: node.x, y: node.y };
+                        });
+                        
+                        return nodes;
+                    }
+                    
+                    // 初次布局 - 使用完整的布局算法
+                    const calculateSubtreeHeight = (nodeId, memo = {}) => {
+                        if (memo[nodeId] !== undefined) return memo[nodeId];
+                        
+                        const children = childrenMap[nodeId] || [];
+                        if (children.length === 0) {
+                            const node = nodes.find(n => n.id === nodeId);
+                            memo[nodeId] = getNodeHeight(node) + 40;
+                            return memo[nodeId];
+                        }
+                        
+                        let totalHeight = 0;
+                        children.forEach(child => {
+                            totalHeight += calculateSubtreeHeight(child.id, memo);
+                        });
+                        
+                        memo[nodeId] = Math.max(totalHeight, getNodeHeight(nodes.find(n => n.id === nodeId)) + 40);
+                        return memo[nodeId];
+                    };
+                    
+                    const layoutHorizontally = (parentNode, children, level, availableY, availableHeight) => {
+                        if (!children || children.length === 0) return;
+                        
+                        const currentX = startX + level * levelWidth;
+                        
+                        const sortedChildren = [...children].sort((a, b) => {
+                            const heightA = calculateSubtreeHeight(a.id);
+                            const heightB = calculateSubtreeHeight(b.id);
+                            return heightB - heightA;
+                        });
+                        
+                        let totalSubtreeHeight = 0;
+                        sortedChildren.forEach(child => {
+                            totalSubtreeHeight += calculateSubtreeHeight(child.id);
+                        });
+                        
+                        const parentCenterY = parentNode ? parentNode.y + getNodeHeight(parentNode) / 2 : centerY;
+                        let currentY = parentCenterY - totalSubtreeHeight / 2;
+                        
+                        sortedChildren.forEach((child, index) => {
+                            const subtreeHeight = calculateSubtreeHeight(child.id);
+                            const nodeHeight = getNodeHeight(child);
+                            
+                            child.x = currentX;
+                            child.y = currentY + subtreeHeight / 2 - nodeHeight / 2;
+                            
+                            const grandChildren = childrenMap[child.id] || [];
+                            if (grandChildren.length > 0) {
+                                layoutHorizontally(child, grandChildren, level + 1, currentY, subtreeHeight);
+                            }
+                            
+                            currentY += subtreeHeight;
+                        });
+                    };
+                    
+                    // 首先放置根節點
+                    const rootNode = nodes.find(n => n.type === 'root');
+                    if (rootNode) {
+                        rootNode.x = startX;
+                        rootNode.y = centerY - getNodeHeight(rootNode) / 2;
+                        
+                        const rootChildren = childrenMap[rootNode.id] || [];
+                        if (rootChildren.length > 0) {
+                            layoutHorizontally(rootNode, rootChildren, 1, 0, 600);
+                        }
+                    }
+                    
+                    // 儲存初始位置並標記不再是初次布局
+                    nodes.forEach(node => {
+                        nodePositionsRef.current[node.id] = { x: node.x, y: node.y };
+                    });
+                    isInitialLayoutRef.current = false;
+                    
+                    return nodes;
+                };
+                
+                const layoutedNodes = layoutNodes(nodes);
+                
+                // 清理已删除節點的記憶位置
+                const currentNodeIds = new Set(nodes.map(n => n.id));
+                Object.keys(nodePositionsRef.current).forEach(nodeId => {
+                    if (!currentNodeIds.has(nodeId)) {
+                        delete nodePositionsRef.current[nodeId];
+                    }
+                });
+                
+                // 繪製連接線 - 適配水平布局
+                const drawLinks = () => {
+                    // 先清除所有連接線
+                    container.selectAll('.connection-line').remove();
+                    
+                    // 獲取節點的連接點 - 針對水平布局優化
+                    const getNodeConnectionPoint = (sourceNode, targetNode) => {
+                        const getNodeDimensions = (n) => {
+                            let width = 160, height = 40;
+                            
+                            if (n.type === 'root') {
+                                width = 80; height = 30;
+                            } else if (n.type === '2d-array') {
+                                const data = n.data;
+                                if (data && data.length > 0) {
+                                    const maxCols = Math.max(...data.map(row => row.length));
+                                    width = Math.max(200, maxCols * 80 + 40);
+                                    height = Math.max(80, data.length * 25 + 40);
+                                }
+                            } else if (n.type === 'complex-box') {
+                                width = 220;
+                                height = 30 + (n.properties || []).length * 20 + (n.slots || []).length * 20;
+                            } else if (n.type === 'string' || n.type === 'number' || n.type === 'boolean' || n.type === 'primitive') {
+                                width = 160; height = 50;
+                            }
+                            
+                            return { width, height };
+                        };
+                        
+                        const sourceDim = getNodeDimensions(sourceNode);
+                        const targetDim = getNodeDimensions(targetNode);
+                        
+                        // 對於水平布局，源節點從右邊緣連出，目標節點從左邊緣連入
+                        const sourceCenterY = sourceNode.y + sourceDim.height / 2;
+                        const targetCenterY = targetNode.y + targetDim.height / 2;
+                        
+                        return {
+                            source: {
+                                x: sourceNode.x + sourceDim.width, // 源節點右邊緣
+                                y: sourceCenterY
+                            },
+                            target: {
+                                x: targetNode.x, // 目標節點左邊緣
+                                y: targetCenterY
+                            }
+                        };
+                    };
+                    
+                    links.forEach(link => {
+                        const sourceNode = layoutedNodes.find(n => n.id === link.sourceId);
+                        const targetNode = layoutedNodes.find(n => n.id === link.targetId);
+                        
+                        if (sourceNode && targetNode) {
+                            if (link.type === 'slot') {
+                                // Slot 連接線 - 從 slot 圓點到目標節點左邊緣
+                                const slots = sourceNode.slots || [];
+                                const properties = sourceNode.properties || [];
+                                const slotIndex = slots.findIndex(slot => slot.key === link.slotKey);
+                                
+                                if (slotIndex >= 0) {
+                                    // slot圓點的精確位置（相對於節點）
+                                    const sourceX = sourceNode.x + 210; // slot dot 的 cx 位置
+                                    const sourceY = sourceNode.y + 45 + properties.length * 20 + slotIndex * 20;
+                                    
+                                    // 目標節點的左邊緣中心
+                                    const targetX = targetNode.x;
+                                    const targetY = targetNode.y + getNodeHeight(targetNode) / 2;
+                                    
+                                    // 創建 JsonCrack 風格的水平曲線
+                                    const midX = sourceX + (targetX - sourceX) / 2;
+                                    
+                                    const path = `M ${sourceX},${sourceY} C ${midX},${sourceY} ${midX},${targetY} ${targetX},${targetY}`;
+                                    
+                                    container.append('path')
+                                        .attr('class', 'connection-line slot-connection')
+                                        .attr('d', path)
+                                        .style('stroke', '#8b5cf6')
+                                        .style('stroke-width', 2.5)
+                                        .style('fill', 'none')
+                                        .style('opacity', 0.8);
+                                }
+                            } else if (link.type === 'parent-child' || link.type === 'root-child') {
+                                // parent-child 和 root-child 連接線 - JsonCrack 風格的水平連接
+                                const connectionPoints = getNodeConnectionPoint(sourceNode, targetNode);
+                                
+                                // 創建平滑的水平曲線
+                                const sourceX = connectionPoints.source.x;
+                                const sourceY = connectionPoints.source.y;
+                                const targetX = connectionPoints.target.x;
+                                const targetY = connectionPoints.target.y;
+                                
+                                // 計算中間控制點，創建平滑的水平曲線
+                                const midX = sourceX + (targetX - sourceX) / 2;
+                                
+                                const path = `M ${sourceX},${sourceY} C ${midX},${sourceY} ${midX},${targetY} ${targetX},${targetY}`;
+                                
+                                container.append('path')
+                                    .attr('class', 'connection-line parent-child-connection')
+                                    .attr('d', path)
+                                    .style('stroke', link.type === 'root-child' ? '#8b5cf6' : '#6b7280')
+                                    .style('stroke-width', link.type === 'root-child' ? 3 : 2)
+                                    .style('fill', 'none')
+                                    .style('opacity', link.type === 'root-child' ? 0.9 : 0.7);
+                            }
+                        }
+                    });
+                    
+                    // 輔助函數 - 獲取節點高度
+                    function getNodeHeight(node) {
+                        if (node.type === 'complex-box') {
+                            const properties = node.properties || [];
+                            const slots = node.slots || [];
+                            return 30 + properties.length * 20 + slots.length * 20;
+                        } else if (node.type === '2d-array') {
+                            const data = node.data;
+                            if (data && data.length > 0) {
+                                return Math.max(80, data.length * 25 + 40);
+                            }
+                            return 80;
+                        } else if (node.type === 'string' || node.type === 'number' || node.type === 'boolean' || node.type === 'primitive') {
+                            return 50;
+                        } else if (node.type === 'root') {
+                            return 30;
+                        }
+                        return 40;
+                    }
+                };
+                
+                drawLinks();
+                
+                // 繪製節點
+                layoutedNodes.forEach(node => {
+                    const nodeGroup = container.append('g')
+                        .attr('transform', `translate(${node.x}, ${node.y})`);
+                    
+                    // 拖拽行為
+                    const drag = d3.drag()
+                        .on('start', () => {
+                            // 拖拽開始時記錄初始位置
+                        })
+                        .on('drag', (event) => {
+                            // 更新節點位置
+                            node.x = event.x;
+                            node.y = event.y;
+                            nodeGroup.attr('transform', `translate(${node.x}, ${node.y})`);
+                            
+                            // 重新繪製所有連接線
+                            drawLinks();
+                        })
+                        .on('end', () => {
+                            // 拖拽結束時確保連接線正確並更新記憶位置
+                            drawLinks();
+                            // 更新節點位置記憶
+                            nodePositionsRef.current[node.id] = { x: node.x, y: node.y };
+                        });
+                    
+                    nodeGroup.call(drag);
+                    
+                    if (node.type === '2d-array') {
+                        // 2D 陣列表格節點 - 顯示實際表格內容
+                        const data = node.data;
+                        const maxCols = data.length > 0 ? Math.max(...data.map(row => row.length)) : 0;
+                        const cellWidth = 80;
+                        const cellHeight = 25;
+                        const tableWidth = maxCols * cellWidth + 40;
+                        const tableHeight = data.length * cellHeight + 40;
+                        
+                        // 主框架
+                        nodeGroup.append('rect')
+                            .attr('class', 'node-rect')
+                            .attr('width', tableWidth)
+                            .attr('height', tableHeight)
+                            .attr('fill', '#f8fafc')
+                            .attr('stroke', '#94a3b8')
+                            .attr('rx', 5)
+                            .style('cursor', 'pointer')
+                            .on('click', () => {
+                                onTableSelect(node.id);
+                                onTableDataChange(node.data);
+                            });
+                        
+                        // 表格標題
+                        nodeGroup.append('rect')
+                            .attr('width', tableWidth)
+                            .attr('height', 25)
+                            .attr('fill', '#475569')
+                            .attr('rx', 5);
+                        
+                        nodeGroup.append('text')
+                            .attr('x', tableWidth / 2)
+                            .attr('y', 15)
+                            .attr('text-anchor', 'middle')
+                            .attr('dominant-baseline', 'middle')
+                            .text(`📊 ${node.name}`)
+                            .style('font-size', '12px')
+                            .style('fill', 'white')
+                            .style('font-weight', 'bold')
+                            .style('pointer-events', 'none');
+                        
+                        // 繪製表格內容
+                        data.forEach((row, rowIndex) => {
+                            row.forEach((cell, colIndex) => {
+                                const x = 20 + colIndex * cellWidth;
+                                const y = 30 + rowIndex * cellHeight;
+                                
+                                // 單元格背景
+                                nodeGroup.append('rect')
+                                    .attr('class', 'table-cell')
+                                    .attr('x', x)
+                                    .attr('y', y)
+                                    .attr('width', cellWidth)
+                                    .attr('height', cellHeight)
+                                    .attr('fill', (rowIndex % 2 === 0) ? '#ffffff' : '#f9fafb')
+                                    .attr('stroke', '#e5e7eb');
+                                
+                                // 單元格文字
+                                let cellText = String(cell);
+                                if (cellText.length > 8) {
+                                    cellText = cellText.substring(0, 6) + '...';
+                                }
+                                
+                                nodeGroup.append('text')
+                                    .attr('x', x + cellWidth / 2)
+                                    .attr('y', y + cellHeight / 2)
+                                    .attr('text-anchor', 'middle')
+                                    .attr('dominant-baseline', 'middle')
+                                    .text(cellText)
+                                    .style('font-size', '10px')
+                                    .style('pointer-events', 'none');
+                            });
+                        });
+                        
+                    } else if (node.type === 'complex-box') {
+                        // Complex-box 節點（垂直列表布局）
+                        const properties = node.properties || [];
+                        const slots = node.slots || [];
+                        const totalHeight = 30 + properties.length * 20 + slots.length * 20;
+                        
+                        // 主框
+                        nodeGroup.append('rect')
+                            .attr('class', 'node-rect')
+                            .attr('width', 220)
+                            .attr('height', totalHeight)
+                            .attr('fill', '#fef3c7')
+                            .attr('stroke', '#f59e0b')
+                            .attr('rx', 5);
+                        
+                        // 標題
+                        nodeGroup.append('rect')
+                            .attr('width', 220)
+                            .attr('height', 25)
+                            .attr('fill', '#f59e0b')
+                            .attr('rx', 5);
+                        
+                        const typeIcon = node.subtype === 'array' ? '🔢' : '📦';
+                        nodeGroup.append('text')
+                            .attr('x', 110)
+                            .attr('y', 15)
+                            .attr('text-anchor', 'middle')
+                            .attr('dominant-baseline', 'middle')
+                            .text(`${typeIcon} ${node.name}`)
+                            .style('font-size', '12px')
+                            .style('fill', 'white')
+                            .style('font-weight', 'bold');
+                        
+                        // 基本屬性
+                        properties.forEach((prop, index) => {
+                            const y = 45 + index * 20;
+                            
+                            // 類型顏色
+                            let color = '#666';
+                            if (prop.type === 'string') color = '#059669';
+                            else if (prop.type === 'number') color = '#dc2626';
+                            else if (prop.type === 'boolean') color = '#7c3aed';
+                            
+                            nodeGroup.append('text')
+                                .attr('x', 10)
+                                .attr('y', y)
+                                .attr('dominant-baseline', 'middle')
+                                .text(`${prop.key}: ${prop.value}`)
+                                .style('font-size', '11px')
+                                .style('fill', color);
+                        });
+                        
+                        // Slot 屬性
+                        slots.forEach((slot, index) => {
+                            const y = 45 + properties.length * 20 + index * 20;
+                            
+                            // Slot 圓點
+                            let dotColor = '#8b5cf6';
+                            if (slot.type === 'array') dotColor = '#3b82f6';
+                            else if (slot.type === '2d-array') dotColor = '#10b981';
+                            else if (slot.type === 'object') dotColor = '#f59e0b';
+                            
+                            nodeGroup.append('circle')
+                                .attr('class', 'slot-dot')
+                                .attr('cx', 210)  // 調整到正確位置 (220寬度 - 10偏移)
+                                .attr('cy', y)
+                                .attr('r', 4)
+                                .attr('fill', dotColor)
+                                .attr('stroke', '#fff')
+                                .attr('stroke-width', 2);
+                            
+                            // Slot 標籤
+                            nodeGroup.append('text')
+                                .attr('x', 10)
+                                .attr('y', y)
+                                .attr('dominant-baseline', 'middle')
+                                .text(slot.key)
+                                .style('font-size', '11px')
+                                .style('fill', '#374151');
+                        });
+                        
+                    } else if (node.type === 'root') {
+                        // 根節點
+                        nodeGroup.append('rect')
+                            .attr('class', 'node-rect')
+                            .attr('width', 80)
+                            .attr('height', 30)
+                            .attr('fill', '#ddd6fe')
+                            .attr('stroke', '#8b5cf6')
+                            .attr('rx', 5);
+                        
+                        nodeGroup.append('text')
+                            .attr('x', 40)
+                            .attr('y', 20)
+                            .attr('text-anchor', 'middle')
+                            .attr('dominant-baseline', 'middle')
+                            .text('🌐 JSON')
+                            .style('font-size', '12px')
+                            .style('font-weight', 'bold');
+                    } else {
+                        // 其他節點類型
+                        let color = '#f3f4f6';
+                        let borderColor = '#9ca3af';
+                        let icon = '📄';
+                        
+                        if (node.type === 'string') {
+                            color = '#dcfce7'; borderColor = '#16a34a'; icon = '📝';
+                        } else if (node.type === 'number') {
+                            color = '#fecaca'; borderColor = '#dc2626'; icon = '🔢';
+                        } else if (node.type === 'boolean') {
+                            color = '#e0e7ff'; borderColor = '#6366f1'; icon = '✅';
+                        } else if (node.type === 'array') {
+                            color = '#dbeafe'; borderColor = '#2563eb'; icon = '📋';
+                        } else if (node.type === 'object') {
+                            color = '#fed7aa'; borderColor = '#ea580c'; icon = '📦';
+                        }
+                        
+                        nodeGroup.append('rect')
+                            .attr('class', 'node-rect')
+                            .attr('width', 160)
+                            .attr('height', 50)
+                            .attr('fill', color)
+                            .attr('stroke', borderColor)
+                            .attr('rx', 5);
+                        
+                        if (node.type === 'primitive' || node.type === 'string' || node.type === 'number' || node.type === 'boolean') {
+                            // 基本類型節點：顯示 key 和 value
+                            // 第一行：key 名稱
+                            nodeGroup.append('text')
+                                .attr('x', 80)
+                                .attr('y', 18)
+                                .attr('text-anchor', 'middle')
+                                .attr('dominant-baseline', 'middle')
+                                .text(`${icon} ${node.name}`)
+                                .style('font-size', '11px')
+                                .style('font-weight', 'bold')
+                                .style('pointer-events', 'none');
+                            
+                            // 第二行：value 值
+                            let valueText = String(node.data);
+                            if (valueText.length > 20) {
+                                valueText = valueText.substring(0, 18) + '...';
+                            }
+                            
+                            nodeGroup.append('text')
+                                .attr('x', 80)
+                                .attr('y', 35)
+                                .attr('text-anchor', 'middle')
+                                .attr('dominant-baseline', 'middle')
+                                .text(valueText)
+                                .style('font-size', '10px')
+                                .style('fill', '#666')
+                                .style('pointer-events', 'none');
+                        } else {
+                            // 其他類型節點：只顯示名稱
+                            nodeGroup.append('text')
+                                .attr('x', 80)
+                                .attr('y', 25)
+                                .attr('text-anchor', 'middle')
+                                .attr('dominant-baseline', 'middle')
+                                .text(`${icon} ${node.name}`)
+                                .style('font-size', '11px')
+                                .style('pointer-events', 'none');
+                        }
+                    }
+                });
+                
+            }, [data, extractTables, detectMajorStructureChange]);
+            
+            return (
+                <div className="h-full bg-white">
+                    <div className="p-4 border-b bg-gray-50">
+                        <h2 className="text-lg font-semibold">關係圖 (Graph View) - v10.0 完整恢復</h2>
+                        <div className="text-xs text-gray-500 mt-1">
+                            JsonCrack風格 + 穩定編輯 + 完整視覺化
+                        </div>
+                    </div>
+                    <div className="graph-container h-full">
+                        <svg ref={svgRef} width="100%" height="100%" />
+                    </div>
+                </div>
+            );
+        };
+
+        // 渲染應用
+        ReactDOM.render(<JSONGraphEditor />, document.getElementById('root'));
+    </script>
+</body>
+</html>
